@@ -277,6 +277,7 @@ func newFramer(conn net.Conn) *framer {
 	}
 	f.fr = http2.NewFramer(f.writer, f.reader)
 	f.fr.ReadMetaHeaders = hpack.NewDecoder(http2InitHeaderTableSize, nil)
+	f.fr.CallerOwnsDataFrameData = true
 	return f
 }
 
