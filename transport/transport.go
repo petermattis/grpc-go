@@ -117,7 +117,7 @@ func (r *recvBufferReader) Read(p []byte) (n int, err error) {
 		return 0, r.err
 	}
 	defer func() { r.err = err }()
-	if r.last != nil && len(r.last) > 0 {
+	if len(r.last) > 0 {
 		// Read remaining data left in last call.
 		copied := copy(p, r.last)
 		r.last = r.last[copied:]
@@ -136,6 +136,38 @@ func (r *recvBufferReader) Read(p []byte) (n int, err error) {
 		copied := copy(p, m.data)
 		r.last = m.data[copied:]
 		return copied, nil
+	}
+}
+
+func (r *recvBufferReader) Next(n int) (b []byte, err error) {
+	if r.err != nil {
+		return nil, r.err
+	}
+	defer func() { r.err = err }()
+	if len(r.last) > 0 {
+		if n <= len(r.last) {
+			// Read remaining data left in last call.
+			b = r.last[:n]
+			r.last = r.last[n:]
+			return b, nil
+		}
+		return nil, nil
+	}
+	select {
+	case <-r.ctx.Done():
+		return nil, ContextErr(r.ctx.Err())
+	case m := <-r.recv.get():
+		r.recv.load()
+		if m.err != nil {
+			return nil, m.err
+		}
+		r.last = m.data
+		if n <= len(r.last) {
+			b = r.last[:n]
+			r.last = r.last[n:]
+			return b, nil
+		}
+		return nil, nil
 	}
 }
 
@@ -219,7 +251,7 @@ type Stream struct {
 	recvCompress string
 	sendCompress string
 	buf          *recvBuffer
-	trReader     io.Reader
+	trReader     *transportReader
 	fc           *inFlow
 	recvQuota    uint32
 
@@ -368,11 +400,21 @@ func (s *Stream) write(m recvMsg) {
 // Read reads all p bytes from the wire for this stream.
 func (s *Stream) Read(p []byte) (n int, err error) {
 	// Don't request a read if there was an error earlier
-	if er := s.trReader.(*transportReader).er; er != nil {
+	if er := s.trReader.er; er != nil {
 		return 0, er
 	}
 	s.requestRead(len(p))
 	return io.ReadFull(s.trReader, p)
+}
+
+// Next TODO(undocumented)
+func (s *Stream) Next(n int) (b []byte, err error) {
+	// Don't request a read if there was an error earlier
+	if er := s.trReader.er; er != nil {
+		return nil, er
+	}
+	s.requestRead(n)
+	return s.trReader.Next(n)
 }
 
 // tranportReader reads all the data available for this Stream from the transport and
@@ -380,7 +422,7 @@ func (s *Stream) Read(p []byte) (n int, err error) {
 // The error is io.EOF when the stream is done or another non-nil error if
 // the stream broke.
 type transportReader struct {
-	reader io.Reader
+	reader *recvBufferReader
 	// The handler to control the window update procedure for both this
 	// particular stream and the associated transport.
 	windowHandler func(int)
@@ -390,6 +432,16 @@ type transportReader struct {
 func (t *transportReader) Read(p []byte) (n int, err error) {
 	n, err = t.reader.Read(p)
 	if err != nil {
+		t.er = err
+		return
+	}
+	t.windowHandler(n)
+	return
+}
+
+func (t *transportReader) Next(n int) (b []byte, err error) {
+	b, err = t.reader.Next(n)
+	if err != nil || b == nil {
 		t.er = err
 		return
 	}

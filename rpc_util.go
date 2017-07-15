@@ -275,8 +275,24 @@ func (p *parser) recvMsg(maxReceiveMessageSize int) (pf payloadFormat, msg []byt
 	if length > uint32(maxReceiveMessageSize) {
 		return 0, nil, Errorf(codes.ResourceExhausted, "grpc: received message larger than max (%d vs. %d)", length, maxReceiveMessageSize)
 	}
-	// TODO(bradfitz,zhaoq): garbage. reuse buffer after proto decoding instead
-	// of making it for each message:
+
+	// Attempt to take the message from the stream without copying.
+	type nexter interface {
+		Next(n int) ([]byte, error)
+	}
+	if nexter, ok := p.r.(nexter); ok {
+		if msg, err = nexter.Next(int(length)); err != nil {
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
+			return 0, nil, err
+		}
+		if msg != nil {
+			return pf, msg, nil
+		}
+	}
+
+	// Fallback to copying the message.
 	msg = make([]byte, int(length))
 	if _, err := p.r.Read(msg); err != nil {
 		if err == io.EOF {
